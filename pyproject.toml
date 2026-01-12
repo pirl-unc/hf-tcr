@@ -1,0 +1,91 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hf-tcr"
+version = "0.1.0"
+description = "HuggingFace-based inference and evaluation library for TCR-pMHC sequence translation models"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.9"
+authors = [
+    {name = "Dhuvi Karthikeyan"}
+]
+keywords = [
+    "TCR",
+    "pMHC",
+    "immunology",
+    "machine-learning",
+    "transformers",
+    "huggingface",
+    "sequence-translation"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=4.30.0",
+    "numpy>=1.21.0",
+    "pandas>=1.3.0",
+    "tqdm>=4.60.0",
+    "python-Levenshtein>=0.20.0",
+    "nltk>=3.7",
+    "einops>=0.6.0",
+    "tidytcells>=2.0.0",
+    "mhcgnomes>=1.8.0",
+    "tcrpmhcdataset>=0.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/pirl-unc/hf-tcr"
+Documentation = "https://github.com/pirl-unc/hf-tcr#readme"
+Repository = "https://github.com/pirl-unc/hf-tcr"
+Issues = "https://github.com/pirl-unc/hf-tcr/issues"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["hf_tcr*"]
+
+[tool.setuptools.package-data]
+hf_tcr = [
+    "assets/*.model",
+    "assets/*.json",
+    "assets/*.txt",
+]
+
+[tool.black]
+line-length = 100
+target-version = ["py39", "py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"

@@ -1,0 +1,4 @@
+include README.md
+include LICENSE
+recursive-include tcr_translate/refs *.csv
+recursive-include tcr_translate/assets *.model *.json *.txt
