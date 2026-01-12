@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Union
 import einops
 import torch
 import torch.nn.functional as F
-from transformers import BartTokenizer, T5Tokenizer, LogitsWarper
+from transformers import BartTokenizer, T5Tokenizer, LogitsProcessor
 
 
 class HuggingFaceModelAdapter:
@@ -383,8 +383,8 @@ class HuggingFaceModelAdapter:
         Returns:
             Model output sequences or dictionary.
         """
-        logits_warper = [
-            TypicalLogitsWarper(
+        logits_processor = [
+            TypicalLogitsProcessor(
                 mass=typical_mass,
                 filter_value=-float("Inf"),
                 min_tokens_to_keep=min_tokens_to_keep,
@@ -395,7 +395,7 @@ class HuggingFaceModelAdapter:
             max_new_tokens=max_len,
             num_return_sequences=n,
             do_sample=True,
-            logits_processor=logits_warper,
+            logits_processor=logits_processor,
             return_dict_in_generate=return_dict,
         )
 
@@ -621,7 +621,7 @@ class HuggingFaceModelAdapter:
         return outs["translations"]
 
 
-class TypicalLogitsWarper(LogitsWarper):
+class TypicalLogitsProcessor(LogitsProcessor):
     """
     Typical sampling logits warper.
 

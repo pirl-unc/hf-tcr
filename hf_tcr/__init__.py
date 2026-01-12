@@ -17,7 +17,7 @@ from tcrpmhcdataset import TCR, pMHC, TCRpMHCdataset
 from .tokenizer import TCRT5Tokenizer, TCRBartTokenizer
 
 # Model adapter for inference
-from .adapter import HuggingFaceModelAdapter, TypicalLogitsWarper
+from .adapter import HuggingFaceModelAdapter, TypicalLogitsProcessor
 
 # Evaluation
 from .evaluation import ModelEvaluator
