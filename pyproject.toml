@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hf-tcr"
-version = "0.1.0"
+version = "0.1.5"
 description = "HuggingFace-based inference and evaluation library for TCR-pMHC sequence translation models"
 readme = "README.md"
 license = {text = "Apache-2.0"}

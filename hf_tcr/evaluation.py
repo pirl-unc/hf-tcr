@@ -606,6 +606,7 @@ class ModelEvaluator(HuggingFaceModelAdapter):
             "seq_recovery": [],
             "diversity": [],
             "perplexity": -100,
+            "translations": {}
         }
 
         metrics["char-bleu"] = self.dataset_bleu(dataset)
@@ -634,6 +635,7 @@ class ModelEvaluator(HuggingFaceModelAdapter):
             metrics["seq_recovery"].append(
                 self._mean_sequence_recovery(src_translations, trg_sequences)
             )
+            metrics["translations"][src.peptide + '_' + src.allele] = src_translations
 
         metrics["precision"] = np.mean(metrics["precision"])
         metrics["recall"] = np.mean(metrics["recall"])
