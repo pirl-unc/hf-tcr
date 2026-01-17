@@ -635,7 +635,7 @@ class ModelEvaluator(HuggingFaceModelAdapter):
             metrics["seq_recovery"].append(
                 self._mean_sequence_recovery(src_translations, trg_sequences)
             )
-            metrics["translations"][src.peptide + '_' + src.allele] = src_translations
+            metrics["translations"][source.peptide + '_' + source.hla_allele] = src_translations
 
         metrics["precision"] = np.mean(metrics["precision"])
         metrics["recall"] = np.mean(metrics["recall"])
