@@ -311,6 +311,189 @@ class ModelEvaluator(HuggingFaceModelAdapter):
         )
 
     @staticmethod
+    def soft_metrics_at_k(
+        translations: List[str],
+        reference_translations: List[str],
+        k: Optional[int] = None,
+        threshold: float = 0.90,
+    ) -> Dict[str, float]:
+        """Compute one-to-one soft scores and many-to-many reference coverage.
+
+        Similarity is 1 - Levenshtein(a, b) / max(len(a), len(b)). It is 0
+        whenever either sequence is empty, including empty/empty (the internal
+        convention). Edges include similarity >= threshold (default 0.90).
+
+        Let G be the first k outputs, R the references, and M the maximum
+        cardinality of a matching in the thresholded bipartite graph. Then
+        soft_precision = M / len(G), soft_recall = M / min(k, len(R)),
+        and soft_f1 is their harmonic mean. reference_coverage counts
+        references with ANY edge / len(R), allowing many-to-many matches.
+
+        No deduplication is performed: duplicate outputs and references are
+        separate vertices. k=None uses all outputs and k=len(translations)
+        for the recall denominator. k=0 returns zeros; negative k raises
+        ValueError. Underfill uses the actual output count for precision but
+        the requested k for recall. Empty inputs/denominators yield zero.
+
+        All four scores share one similarity matrix and one matching.
+        Previous internal many-to-many soft recall could exceed 1 because
+        one output could hit multiple references while its denominator was
+        capped at k. One-to-one matching bounds all three soft scores by 1.
+        Historical and corrected soft values are not directly interchangeable;
+        reference_coverage retains many-to-many reference coverage.
+
+        Example::
+
+            scores = ModelEvaluator.soft_metrics_at_k(
+                ["AAAAAAAAAA"], ["AAAAAAAAAA", "AAAAAAAAAB"], k=1)
+            assert scores["soft_recall"] == 1.0
+            assert scores["reference_coverage"] == 1.0
+        """
+        if k is not None and (not isinstance(k, (int, np.integer)) or isinstance(k, bool)):
+            raise TypeError("k must be an integer or None")
+        if k is not None and k < 0:
+            raise ValueError("k must be nonnegative")
+        if not 0 <= threshold <= 1:
+            raise ValueError("threshold must be between 0 and 1")
+        limit = len(translations) if k is None else k
+        generated = translations[:limit]
+        refs = reference_translations
+        similarities = np.empty((len(generated), len(refs)), dtype=float)
+        for i, generated_seq in enumerate(generated):
+            for j, ref in enumerate(refs):
+                length = max(len(generated_seq), len(ref))
+                similarities[i, j] = (
+                    1 - levenshtein.distance(generated_seq, ref) / length
+                    if generated_seq and ref else 0.0
+                )
+        edges = similarities >= threshold
+
+        # Augmenting paths maximize valid-pair count, not summed similarity.
+        # Iterative traversal avoids recursion limits for large candidate sets.
+        ref_owner = {}
+        for start in range(len(generated)):
+            parents = {}
+            seen_outputs = {start}
+            queue = [start]
+            free_ref = None
+            for output in queue:
+                for ref in np.flatnonzero(edges[output]):
+                    if ref in parents:
+                        continue
+                    parents[ref] = output
+                    if ref not in ref_owner:
+                        free_ref = ref
+                        break
+                    owner = ref_owner[ref]
+                    if owner not in seen_outputs:
+                        seen_outputs.add(owner)
+                        queue.append(owner)
+                if free_ref is not None:
+                    break
+            if free_ref is not None:
+                # Reverse the alternating path, reassigning occupied edges.
+                output_refs = {owner: ref for ref, owner in ref_owner.items()}
+                ref = free_ref
+                while True:
+                    output = parents[ref]
+                    previous = output_refs.get(output)
+                    ref_owner[ref] = output
+                    if previous is None:
+                        break
+                    ref = previous
+
+        def ratio(numerator, denominator):
+            return float(numerator / denominator) if denominator else 0.0
+
+        def harmonic(precision, recall):
+            return 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+
+        matches = len(ref_owner)
+        recall_denominator = min(limit, len(refs))
+        precision = ratio(matches, len(generated))
+        recall = ratio(matches, recall_denominator)
+        covered = int(edges.any(axis=0).sum())
+        return {
+            "soft_precision": precision,
+            "soft_recall": recall,
+            "soft_f1": harmonic(precision, recall),
+            "reference_coverage": ratio(covered, len(refs)),
+        }
+
+    @staticmethod
+    def soft_precision(translations, reference_translations, k=None, threshold=0.90) -> float:
+        """Return soft_precision; see :meth:`soft_metrics_at_k` for semantics."""
+        return ModelEvaluator.soft_metrics_at_k(
+            translations, reference_translations, k=k, threshold=threshold
+        )["soft_precision"]
+
+    @staticmethod
+    def soft_recall(translations, reference_translations, k=None, threshold=0.90) -> float:
+        """Return soft_recall; see :meth:`soft_metrics_at_k` for semantics."""
+        return ModelEvaluator.soft_metrics_at_k(
+            translations, reference_translations, k=k, threshold=threshold
+        )["soft_recall"]
+
+    @staticmethod
+    def soft_f1(translations, reference_translations, k=None, threshold=0.90) -> float:
+        """Return soft_f1; see :meth:`soft_metrics_at_k` for semantics."""
+        return ModelEvaluator.soft_metrics_at_k(
+            translations, reference_translations, k=k, threshold=threshold
+        )["soft_f1"]
+
+    @staticmethod
+    def reference_coverage(translations, reference_translations, k=None, threshold=0.90) -> float:
+        """Return reference_coverage; see :meth:`soft_metrics_at_k` for semantics."""
+        return ModelEvaluator.soft_metrics_at_k(
+            translations, reference_translations, k=k, threshold=threshold
+        )["reference_coverage"]
+
+    @staticmethod
+    def _soft_precision_at_k(
+        translations: List[str],
+        reference_translations: List[str],
+        threshold: float = 0.90,
+        k: Optional[int] = None,
+    ) -> float:
+        """Corrected soft precision, preserving the internal threshold-before-k API.
+
+        Delegates to soft_metrics_at_k; uses one-to-one maximum matching.
+        """
+        return ModelEvaluator.soft_metrics_at_k(
+            translations, reference_translations, k=k, threshold=threshold
+        )["soft_precision"]
+
+    @staticmethod
+    def _soft_recall_at_k(
+        translations: List[str],
+        reference_translations: List[str],
+        threshold: float = 0.90,
+        k: Optional[int] = 100,
+    ) -> float:
+        """Corrected soft recall, preserving the internal threshold-before-k API.
+
+        Delegates to soft_metrics_at_k; uses one-to-one maximum matching.
+        """
+        return ModelEvaluator.soft_metrics_at_k(
+            translations, reference_translations, k=k, threshold=threshold
+        )["soft_recall"]
+
+    @staticmethod
+    def _soft_f1_at_k(
+        translations: List[str],
+        reference_translations: List[str],
+        threshold: float = 0.90,
+        k: Optional[int] = 100,
+    ) -> float:
+        """Corrected soft f1, preserving the internal threshold-before-k API.
+
+        Delegates to soft_metrics_at_k; uses one-to-one maximum matching.
+        """
+        return ModelEvaluator.soft_metrics_at_k(
+            translations, reference_translations, k=k, threshold=threshold
+        )["soft_f1"]
+
+    @staticmethod
     def _precision_at_k(
         translations: List[str],
         reference_translations: List[str],
@@ -372,6 +555,9 @@ class ModelEvaluator(HuggingFaceModelAdapter):
         """
         per_sequence_percents = []
         for translation in translations:
+            if translation == "" and "" in reference_translations:
+                per_sequence_percents.append(1.0)
+                continue
             same_len_references = [
                 ref for ref in reference_translations if len(ref) == len(translation)
             ]
@@ -381,6 +567,7 @@ class ModelEvaluator(HuggingFaceModelAdapter):
                 )[0]
                 per_sequence_percents.append(
                     1 - levenshtein.distance(translation, closest_match) / len(closest_match)
+                    if closest_match else 0.0
                 )
                 continue
             closest_match = ModelEvaluator.find_n_closest_matches(
@@ -574,15 +761,26 @@ class ModelEvaluator(HuggingFaceModelAdapter):
         k: int = 100,
         max_len: int = 25,
         mode: str = "top_k",
+        soft_threshold: float = 0.90,
         **kwargs,
     ) -> Dict:
         """
         Calculate performance metrics at dataset-level granularity.
 
+        Adds the four keys documented in soft_metrics_at_k, macro-averaged
+        per source (including F1). Existing exact-match keys are unchanged.
+        References retain the existing per-source deduplication; generated
+        entries are not deduplicated. Soft scores use only the first k outputs
+        and share one similarity matrix per source. Generation is unchanged.
+        This generation API requires positive integer k (None, zero, and
+        negative values are rejected); use soft_metrics_at_k for k=None/0.
+        Empty datasets return zero scores and an empty translations mapping.
+
         Args:
             dataset: A TCRpMHCDataset object.
             k: The number of translations to consider.
             max_len: Maximum length of generated translations.
+            soft_threshold: Inclusive soft-match threshold, default 0.90.
             mode: The mode of generation (e.g., 'top_k', 'greedy').
             **kwargs: Additional keyword arguments for generation.
 
@@ -597,6 +795,11 @@ class ModelEvaluator(HuggingFaceModelAdapter):
                 - seq_recovery: Mean sequence recovery
                 - perplexity: Perplexity score
         """
+        if not isinstance(k, (int, np.integer)) or isinstance(k, bool):
+            raise TypeError("dataset_metrics_at_k requires a positive integer k")
+        if k <= 0:
+            raise ValueError("dataset_metrics_at_k requires a positive integer k")
+        soft_keys = self.soft_metrics_at_k([], [], k=k, threshold=soft_threshold)
         metrics = {
             "char-bleu": -100,
             "precision": [],
@@ -609,10 +812,13 @@ class ModelEvaluator(HuggingFaceModelAdapter):
             "translations": {}
         }
 
+        metrics.update({key: [] for key in soft_keys})
+        reference_dict = _dataset_to_seq2seq_dict(dataset)
+        if not reference_dict:
+            return {key: {} if key == "translations" else 0.0 for key in metrics}
+
         metrics["char-bleu"] = self.dataset_bleu(dataset)
         metrics["perplexity"] = np.exp(self.evaluate_loss(dataset, cumulative=False))
-
-        reference_dict = _dataset_to_seq2seq_dict(dataset)
 
         for source in tqdm(
             list(set(dataset.get_srclist())), desc="Calculating @K Metrics"
@@ -622,26 +828,34 @@ class ModelEvaluator(HuggingFaceModelAdapter):
             )
             trg_sequences = reference_dict[source]
 
+            soft_scores = self.soft_metrics_at_k(
+                src_translations, trg_sequences, k=k, threshold=soft_threshold
+            )
+            for key, value in soft_scores.items():
+                metrics[key].append(value)
+
             precision, recall, f1 = self._precision_recall_f1_at_k(
                 src_translations, trg_sequences, k=k
-            )
+            ) if src_translations else (0.0, 0.0, 0.0)
             metrics["precision"].append(precision)
             metrics["recall"].append(recall)
             metrics["f1"].append(f1)
             metrics["d_edit"].append(
-                self._mean_edit_distance(src_translations, trg_sequences)
+                self._mean_edit_distance(src_translations, trg_sequences) if src_translations else 0.0
             )
             metrics["diversity"] += src_translations
             metrics["seq_recovery"].append(
-                self._mean_sequence_recovery(src_translations, trg_sequences)
+                self._mean_sequence_recovery(src_translations, trg_sequences) if src_translations else 0.0
             )
             metrics["translations"][source.peptide + '_' + source.hla_allele] = src_translations
 
+        for key in soft_keys:
+            metrics[key] = float(np.mean(metrics[key]))
         metrics["precision"] = np.mean(metrics["precision"])
         metrics["recall"] = np.mean(metrics["recall"])
         metrics["f1"] = np.mean(metrics["f1"])
         metrics["d_edit"] = np.mean(metrics["d_edit"])
-        metrics["diversity"] = len(set(metrics["diversity"])) / len(metrics["diversity"])
+        metrics["diversity"] = len(set(metrics["diversity"])) / len(metrics["diversity"]) if metrics["diversity"] else 0.0
         metrics["seq_recovery"] = np.mean(metrics["seq_recovery"])
 
         return metrics
