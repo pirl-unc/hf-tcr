@@ -8,7 +8,7 @@ This library provides tools for:
 Data structures (TCR, pMHC, TCRpMHCdataset) are provided by the tcrpmhcdataset package.
 """
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 # Re-export core data structures from tcrpmhcdataset
 from tcrpmhcdataset import TCR, pMHC, TCRpMHCdataset

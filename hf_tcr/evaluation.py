@@ -317,15 +317,16 @@ class ModelEvaluator(HuggingFaceModelAdapter):
         k: Optional[int] = None,
         threshold: float = 0.90,
     ) -> Dict[str, float]:
-        """Compute one-to-one soft scores and many-to-many reference coverage.
+        """Compute output precision, one-to-one recall, and reference coverage.
 
         Similarity is 1 - Levenshtein(a, b) / max(len(a), len(b)). It is 0
         whenever either sequence is empty, including empty/empty (the internal
         convention). Edges include similarity >= threshold (default 0.90).
 
-        Let G be the first k outputs, R the references, and M the maximum
-        cardinality of a matching in the thresholded bipartite graph. Then
-        soft_precision = M / len(G), soft_recall = M / min(k, len(R)),
+        Let G be the first k outputs, R the references, H the number of outputs
+        with ANY eligible edge, and M the maximum cardinality of a matching
+        in the thresholded bipartite graph. Then soft_precision = H / len(G),
+        soft_recall = M / min(k, len(R)),
         and soft_f1 is their harmonic mean. reference_coverage counts
         references with ANY edge / len(R), allowing many-to-many matches.
 
@@ -335,10 +336,16 @@ class ModelEvaluator(HuggingFaceModelAdapter):
         ValueError. Underfill uses the actual output count for precision but
         the requested k for recall. Empty inputs/denominators yield zero.
 
+        Precision measures whether each output is near a known reference:
+        each output counts at most once, but references may be reused. Recall
+        measures distinct reference recovery through one-to-one matching.
+        Compared with 0.2.2, precision and F1 may increase for identical inputs;
+        recall and reference coverage are unchanged.
+
         All four scores share one similarity matrix and one matching.
         Previous internal many-to-many soft recall could exceed 1 because
         one output could hit multiple references while its denominator was
-        capped at k. One-to-one matching bounds all three soft scores by 1.
+        capped at k. One-to-one recall and output-based precision stay bounded by 1.
         Historical and corrected soft values are not directly interchangeable;
         reference_coverage retains many-to-many reference coverage.
 
@@ -410,7 +417,8 @@ class ModelEvaluator(HuggingFaceModelAdapter):
 
         matches = len(ref_owner)
         recall_denominator = min(limit, len(refs))
-        precision = ratio(matches, len(generated))
+        hit_outputs = int(edges.any(axis=1).sum())
+        precision = ratio(hit_outputs, len(generated))
         recall = ratio(matches, recall_denominator)
         covered = int(edges.any(axis=0).sum())
         return {
@@ -457,7 +465,7 @@ class ModelEvaluator(HuggingFaceModelAdapter):
     ) -> float:
         """Corrected soft precision, preserving the internal threshold-before-k API.
 
-        Delegates to soft_metrics_at_k; uses one-to-one maximum matching.
+        Delegates to soft_metrics_at_k; allows reference reuse for output precision.
         """
         return ModelEvaluator.soft_metrics_at_k(
             translations, reference_translations, k=k, threshold=threshold
@@ -487,7 +495,7 @@ class ModelEvaluator(HuggingFaceModelAdapter):
     ) -> float:
         """Corrected soft f1, preserving the internal threshold-before-k API.
 
-        Delegates to soft_metrics_at_k; uses one-to-one maximum matching.
+        Delegates to soft_metrics_at_k; combines output precision and one-to-one recall.
         """
         return ModelEvaluator.soft_metrics_at_k(
             translations, reference_translations, k=k, threshold=threshold
