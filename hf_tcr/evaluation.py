@@ -5,6 +5,7 @@ This module provides comprehensive evaluation functionality for measuring
 the performance of translation models on TCR-pMHC datasets.
 """
 import copy
+from functools import partial
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -13,6 +14,7 @@ import Levenshtein as levenshtein
 from tqdm import tqdm
 from nltk.translate.bleu_score import sentence_bleu, corpus_bleu, SmoothingFunction
 
+from transformers import T5Tokenizer
 from torch.utils.data import DataLoader
 from tcrpmhcdataset import TCRpMHCdataset
 
@@ -24,17 +26,31 @@ def _create_collate_fn(tokenizer, dataset: TCRpMHCdataset):
     """
     Create a collate function that uses the proper tokenization methods.
 
-    This ensures tokenization is consistent with training by using
-    tokenize_tcr and tokenize_pmhc methods for our custom tokenizers.
+    TCR-T5 inputs use the existing task-formatting helpers for both custom
+    and plain checkpoint T5Tokenizer instances. The tokenizer adds EOS once;
+    this collator does not append EOS text. Length limits remain 25 for TCR
+    and 52 for pMHC, including special tokens. Custom BART formatting is
+    unchanged. Target attention-mask zeros become label -100 (ignored by CE).
 
     Args:
-        tokenizer: A tokenizer instance (TCRT5Tokenizer or TCRBartTokenizer).
+        tokenizer: TCRT5Tokenizer, plain TCR-checkpoint T5Tokenizer, or BART.
         dataset: A TCRpMHCdataset instance to determine source/target direction.
 
     Returns:
         A collate function for use with DataLoader.
     """
+    if isinstance(tokenizer, T5Tokenizer):
+        # These helpers only format strings and call self; they also work with
+        # the plain T5 tokenizer used by checkpoint-loading callers.
+        tokenize_tcr = partial(TCRT5Tokenizer.tokenize_tcr, tokenizer)
+        tokenize_pmhc = partial(TCRT5Tokenizer.tokenize_pmhc, tokenizer)
+    else:
+        tokenize_tcr = getattr(tokenizer, 'tokenize_tcr', None)
+        tokenize_pmhc = getattr(tokenizer, 'tokenize_pmhc', None)
+
     def _collate_fn(batch):
+        if not batch:
+            raise ValueError("Cannot collate an empty evaluation batch")
         source_batch, target_batch = tuple(zip(*batch))
 
         # Determine which is pMHC and which is TCR based on dataset.source
@@ -50,15 +66,15 @@ def _create_collate_fn(tokenizer, dataset: TCRpMHCdataset):
         pmhc_tuples = [(pmhc.peptide, pmhc.pseudo) for pmhc in pmhc_batch]
 
         # Use the proper tokenization methods
-        if hasattr(tokenizer, 'tokenize_tcr') and hasattr(tokenizer, 'tokenize_pmhc'):
-            batched_tcrs = tokenizer.tokenize_tcr(
+        if tokenize_tcr is not None and tokenize_pmhc is not None:
+            batched_tcrs = tokenize_tcr(
                 tcr_sequences,
                 padding=True,
                 truncation=True,
                 max_length=25,
                 return_tensors='pt'
             )
-            batched_pmhcs = tokenizer.tokenize_pmhc(
+            batched_pmhcs = tokenize_pmhc(
                 pmhc_tuples,
                 padding=True,
                 truncation=True,
@@ -83,13 +99,14 @@ def _create_collate_fn(tokenizer, dataset: TCRpMHCdataset):
                 return_tensors='pt'
             )
 
-        # Return batched data with labels based on translation direction
         if dataset.source == 'pmhc':
-            batched_pmhcs['labels'] = batched_tcrs['input_ids']
-            return batched_pmhcs
+            inputs, targets = batched_pmhcs, batched_tcrs
         else:
-            batched_tcrs['labels'] = batched_pmhcs['input_ids']
-            return batched_tcrs
+            inputs, targets = batched_tcrs, batched_pmhcs
+        inputs['labels'] = targets['input_ids'].masked_fill(
+            targets['attention_mask'].eq(0), -100
+        )
+        return inputs
 
     return _collate_fn
 
@@ -593,80 +610,88 @@ class ModelEvaluator(HuggingFaceModelAdapter):
         dataset: TCRpMHCdataset,
         max_memory_usage: float = 0.97,
     ) -> int:
-        """
-        Determine optimal batch size based on GPU memory.
+        """Probe a positive evaluation batch size using the evaluation collator.
 
-        Args:
-            dataset: The dataset to evaluate.
-            max_memory_usage: Maximum fraction of GPU memory to use.
-
-        Returns:
-            int: The optimal batch size.
+        CUDA probes use the same task formatting, masked labels, and device
+        placement as evaluate_loss. Return the largest successful probe (at
+        least 1); if even one example exhausts memory, return 1 so evaluation
+        reports that OOM. Non-CUDA devices use at most 512 examples. Empty
+        datasets return 1. Unrelated model errors are not treated as OOM.
         """
+        device = torch.device(self.device)
+        if device.type != "cuda" or len(dataset) == 0:
+            return max(1, min(512, len(dataset)))
+        self.model.to(device)
         self.model.eval()
-        bsz = 1
-
-        while bsz < min(len(dataset), 2048):
+        limit = min(len(dataset), 2048)
+        candidate, successful = 1, 1
+        while True:
+            batch = outputs = None
             try:
-                if bsz * 2 >= len(dataset):
-                    return bsz
-                dloader = dataset.get_dataloader(self.tokenizer, batch_size=bsz)
-
-                with torch.no_grad():
-                    batch = next(iter(dloader))
-                    _ = self.model(**batch.to(self.device))
-
-                memory_allocated = torch.cuda.memory_allocated(self.device)
-                memory_cached = torch.cuda.memory_reserved(self.device)
-                memory_usage = memory_allocated / (memory_cached + 1)
-
-                if memory_usage <= max_memory_usage:
-                    bsz *= 2
-                else:
-                    break
-            except RuntimeError:
-                bsz //= 2
-                break
-
-        torch.cuda.empty_cache()
-        return bsz // 2
+                batch = next(iter(_get_dataloader(
+                    dataset, self.tokenizer, batch_size=candidate
+                ))).to(device)
+                if batch['labels'].ne(-100).any():
+                    with torch.no_grad():
+                        outputs = self.model(**batch)
+                successful = candidate
+                usage = (torch.cuda.memory_allocated(device)
+                         / torch.cuda.get_device_properties(device).total_memory)
+                if usage >= max_memory_usage or candidate == limit:
+                    return successful
+            except torch.cuda.OutOfMemoryError:
+                return successful
+            finally:
+                del outputs, batch
+                torch.cuda.empty_cache()
+            candidate = min(2 * candidate, limit)
 
     def evaluate_loss(
         self, dataset: TCRpMHCdataset, cumulative: bool = False
     ) -> float:
+        """Evaluate masked target-token negative log-likelihood (NLL).
+
+        The default is total token NLL / number of valid target tokens, not
+        an unweighted mean of batch losses. Task markers and EOS count;
+        padding (label -100) does not. Perplexity is exp(this mean).
+
+        cumulative=True returns total token NLL, changing the former sum of
+        batch-mean losses. No repository callers relied on that former sum.
+        Batches without valid targets are skipped. With no valid tokens
+        (including an empty dataset), cumulative=True returns 0.0 and mean
+        mode raises ValueError because mean loss/perplexity are undefined.
+        The public signature and 25/52-token truncation limits are unchanged.
         """
-        Evaluate the loss of the model on a dataset.
-
-        Uses the HuggingFace model loss function (CrossEntropyLoss).
-
-        Args:
-            dataset: A TCRpMHCDataset object.
-            cumulative: Return cumulative loss if True, else average loss.
-
-        Returns:
-            float: The average or cumulative loss across the dataset.
-        """
-        bsz = min(512, len(dataset))
-        if self.device != "cpu":
-            bsz = self.get_batch_size(dataset)
+        device = torch.device(self.device)
+        self.model.to(device)
         self.model.eval()
-        # Use custom dataloader with proper tokenization (tokenize_tcr/tokenize_pmhc)
-        dloader = _get_dataloader(dataset, self.tokenizer, batch_size=bsz)
-        num_batches = len(dloader)
-
-        cum_loss = 0
-
-        with torch.no_grad():
-            for batch in tqdm(dloader, desc="XEntropy Loss"):
-                batch.to(self.device)
-                outs = self.model(**batch)
-                cum_loss += outs.loss
-                torch.cuda.empty_cache()
-
+        total_nll, total_tokens = 0.0, 0
+        if len(dataset):
+            bsz = (self.get_batch_size(dataset) if device.type == "cuda"
+                   else min(512, len(dataset)))
+            dloader = _get_dataloader(dataset, self.tokenizer, batch_size=bsz)
+            with torch.no_grad():
+                for batch in tqdm(dloader, desc="Token NLL"):
+                    batch = batch.to(device)
+                    labels = batch['labels']
+                    valid_tokens = int(labels.ne(-100).sum().item())
+                    if not valid_tokens:
+                        continue
+                    outputs = self.model(**batch)
+                    # Compute NLL explicitly so aggregation never depends on a
+                    # model's batch-mean loss reduction or padding count.
+                    nll = torch.nn.functional.cross_entropy(
+                        outputs.logits.float().reshape(-1, outputs.logits.shape[-1]),
+                        labels.reshape(-1), ignore_index=-100, reduction="sum",
+                    )
+                    total_nll += nll.item()
+                    total_tokens += valid_tokens
+                    del outputs, nll
         if cumulative:
-            return cum_loss.item()
-
-        return cum_loss.item() / num_batches
+            return total_nll
+        if not total_tokens:
+            raise ValueError("Mean evaluation loss is undefined: no valid target tokens")
+        return total_nll / total_tokens
 
     def _precision_recall_f1_at_k(
         self, translations: List[str], ref_trgs: List[str], k: int = 100
